@@ -1,0 +1,6 @@
+pystray>=0.19.4
+pillow>=9.0.0
+keyboard>=0.13.5
+mouse>=0.7.1
+WMI>=1.5.1
+pywin32>=306 
