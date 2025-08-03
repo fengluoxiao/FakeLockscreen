@@ -125,6 +125,8 @@ class FakeLockScreen:
         self.keyboard_hook = None
         self.original_brightness = None
         self.mouse_hidden = False
+        self.start_on_boot = False
+        self.shortcut_name = "FakeLockScreen.lnk"
         
         debug_print("🔆 初始化WMI连接...")
         # 初始化WMI连接
@@ -144,6 +146,10 @@ class FakeLockScreen:
         debug_print("📄 加载设置...")
         self.load_settings() # 恢复加载设置
         
+        # 与文件系统上的快捷方式状态同步
+        self.start_on_boot = self.is_startup_enabled()
+        debug_print(f"💡 开机自启状态: {self.start_on_boot}")
+        
         debug_print("🖥️ 创建主窗口...")
         self.create_main_window()
         
@@ -154,6 +160,90 @@ class FakeLockScreen:
         self.create_tray_icon()
         
         debug_print("✅ FakeLockScreen初始化完成")
+
+    def get_startup_folder(self):
+        """获取Windows启动文件夹路径"""
+        return os.path.join(os.getenv('APPDATA'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+
+    def get_shortcut_path(self):
+        """获取快捷方式的完整路径"""
+        return os.path.join(self.get_startup_folder(), self.shortcut_name)
+
+    def is_startup_enabled(self):
+        """检查开机自启是否已启用（通过检查快捷方式是否存在）"""
+        if os.name != 'nt':
+            return False
+        return os.path.exists(self.get_shortcut_path())
+
+    def _manage_startup_shortcut(self, create=True):
+        """使用PowerShell创建或删除启动快捷方式"""
+        if os.name != 'nt':
+            debug_print("ℹ️ 开机自启功能仅支持Windows。")
+            return False
+
+        shortcut_path = self.get_shortcut_path()
+
+        if not create:
+            if os.path.exists(shortcut_path):
+                try:
+                    os.remove(shortcut_path)
+                    debug_print(f"✓ 已删除启动快捷方式: {shortcut_path}")
+                    return True
+                except Exception as e:
+                    debug_print(f"❌ 删除快捷方式失败: {e}")
+                    messagebox.showerror("错误", f"删除快捷方式失败: {e}")
+                    return False
+            return True # 不存在时，删除操作也视为成功
+
+        # --- 创建快捷方式 ---
+        # 确保启动目录存在
+        startup_dir = self.get_startup_folder()
+        if not os.path.exists(startup_dir):
+            os.makedirs(startup_dir)
+
+        pythonw_exe = sys.executable.replace("python.exe", "pythonw.exe")
+        script_path = os.path.abspath(sys.argv[0])
+        working_dir = os.path.dirname(script_path)
+
+        ps_command = f"""
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
+$Shortcut.TargetPath = '{pythonw_exe}'
+$Shortcut.Arguments = '"{script_path}"'
+$Shortcut.WorkingDirectory = '{working_dir}'
+$Shortcut.WindowStyle = 1
+$Shortcut.IconLocation = '{pythonw_exe}, 0'
+$Shortcut.Description = '启动假锁屏工具'
+$Shortcut.Save()
+"""
+        try:
+            subprocess.run(["powershell", "-Command", ps_command], check=True, capture_output=True, text=True, creationflags=0x08000000)
+            debug_print(f"✓ 已创建启动快捷方式: {shortcut_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            error_message = f"创建快捷方式失败: {e.stderr}"
+            debug_print(f"❌ {error_message}")
+            messagebox.showerror("错误", error_message)
+            return False
+        except FileNotFoundError:
+            debug_print(f"❌ 创建快捷方式失败: PowerShell未找到。")
+            messagebox.showerror("错误", "创建快捷方式失败: 未找到PowerShell, 请确保已安装。")
+            return False
+
+    def toggle_startup(self):
+        """切换开机自启状态"""
+        new_status = not self.start_on_boot
+        success = self._manage_startup_shortcut(create=new_status)
+
+        if success:
+            self.start_on_boot = new_status
+            self.save_settings()
+            status_msg = "启用" if self.start_on_boot else "禁用"
+            debug_print(f"🔄 开机自启已{status_msg}")
+        else:
+            # 如果操作失败，状态应恢复
+            debug_print(f"❌ 开机自启状态切换失败，状态保持为: {self.start_on_boot}")
+            messagebox.showwarning("操作失败", "无法更新开机自启设置，请检查程序是否以管理员权限运行。")
 
     def load_settings(self):
         """加载设置"""
@@ -168,6 +258,7 @@ class FakeLockScreen:
                     settings = json.load(f)
                     self.unlock_key = settings.get('unlock_key', 'ctrl+alt+u')
                     self.lock_key = settings.get('lock_key', 'ctrl+alt+l')
+                    self.start_on_boot = settings.get('start_on_boot', False)
                 debug_print(f"✓ 已从 '{self.settings_file}' 加载设置。")
             else:
                 debug_print(f"ℹ️ 配置文件 '{self.settings_file}' 不存在，使用默认设置。")
@@ -184,7 +275,8 @@ class FakeLockScreen:
 
             settings = {
                 'unlock_key': self.unlock_key,
-                'lock_key': self.lock_key
+                'lock_key': self.lock_key,
+                'start_on_boot': self.start_on_boot
             }
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
@@ -751,12 +843,20 @@ class FakeLockScreen:
         def lock_from_tray(icon, item):
             self.lock_screen()
 
+        def toggle_startup_wrapper(icon, item):
+            self.toggle_startup()
+
         def quit_app(icon, item):
             self.quit_application()
 
         menu = pystray.Menu(
             pystray.MenuItem("显示主窗口", show_window),
             pystray.MenuItem("锁定屏幕", lock_from_tray),
+            pystray.MenuItem(
+                "开机自启",
+                toggle_startup_wrapper,
+                checked=lambda item: self.start_on_boot
+            ),
             pystray.MenuItem("退出", quit_app)
         )
 
